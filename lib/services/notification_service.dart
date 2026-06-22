@@ -21,6 +21,22 @@ const _kAndroidNotifDetails = AndroidNotificationDetails(
 );
 const _kNotifDetails = NotificationDetails(android: _kAndroidNotifDetails);
 
+// v2: channel properties are immutable after creation — new ID forces fresh channel
+// with alarm audio stream (separate volume from notifications, bypasses DND).
+const _kAlarmChannelId = 'ancora_dose_alarm_v2';
+const _kAndroidAlarmDetails = AndroidNotificationDetails(
+  _kAlarmChannelId,
+  'Dose Alarm',
+  importance: Importance.max,
+  priority: Priority.max,
+  sound: UriAndroidNotificationSound('content://settings/system/alarm_alert'),
+  playSound: true,
+  enableVibration: true,
+  audioAttributesUsage: AudioAttributesUsage.alarm,
+  category: AndroidNotificationCategory.alarm,
+);
+const _kAlarmNotifDetails = NotificationDetails(android: _kAndroidAlarmDetails);
+
 AndroidFlutterLocalNotificationsPlugin? get _androidPlugin =>
     _localNotifs.resolvePlatformSpecificImplementation<
         AndroidFlutterLocalNotificationsPlugin>();
@@ -52,6 +68,19 @@ class NotificationService {
               importance: Importance.high,
             ),
           );
+      await _localNotifs
+          .resolvePlatformSpecificImplementation<
+              AndroidFlutterLocalNotificationsPlugin>()
+          ?.createNotificationChannel(
+            const AndroidNotificationChannel(
+              _kAlarmChannelId,
+              'Dose Alarm',
+              importance: Importance.max,
+              sound: UriAndroidNotificationSound(
+                  'content://settings/system/alarm_alert'),
+              audioAttributesUsage: AudioAttributesUsage.alarm,
+            ),
+          );
 
       await _localNotifs.initialize(
         settings: const InitializationSettings(
@@ -59,6 +88,8 @@ class NotificationService {
         ),
       );
 
+      // Request POST_NOTIFICATIONS permission on Android 13+ (API 33+).
+      await _androidPlugin?.requestNotificationsPermission();
       // Request exact alarm permission on Android 12+ (API 31+).
       await _androidPlugin?.requestExactAlarmsPermission();
 
@@ -259,6 +290,86 @@ class NotificationService {
     final base = medId.hashCode.abs() % 100000;
     for (int i = 0; i < 75; i++) {
       await _localNotifs.cancel(id: base + i);
+    }
+  }
+}
+
+/// Checks whether any dose reminder is due within the last 16 minutes and
+/// fires it directly via show() — bypassing the Samsung-broken BroadcastReceiver.
+/// Called from the WorkManager isolate every 15 minutes.
+Future<void> checkAndShowDueNotifications() async {
+  if (kIsWeb) return;
+
+  final user = FirebaseAuth.instance.currentUser;
+  if (user == null) return;
+
+  final db = FirebaseFirestore.instance;
+  final now = DateTime.now();
+  // Look 14 minutes ahead so WorkManager fires notifications slightly early
+  // rather than late — better for medication adherence than a late reminder.
+  final windowStart = now.subtract(const Duration(minutes: 2));
+  final windowEnd = now.add(const Duration(minutes: 14));
+
+  final medsSnap = await db
+      .collection('users')
+      .doc(user.uid)
+      .collection('medications')
+      .get();
+
+  for (final med in medsSnap.docs) {
+    final data = med.data();
+    if (data['archived'] == true) continue;
+
+    final startTs = (data['startDate'] as Timestamp?)?.toDate();
+    final endTs = (data['endDate'] as Timestamp?)?.toDate();
+    if (startTs == null || endTs == null) continue;
+
+    final startDay = DateTime(startTs.year, startTs.month, startTs.day);
+    final endDay = DateTime(endTs.year, endTs.month, endTs.day);
+    final today = DateTime(now.year, now.month, now.day);
+    if (today.isBefore(startDay) || today.isAfter(endDay)) continue;
+
+    final medName = (data['name'] as String?) ?? '';
+    final times = List<String>.from(data['intakeTimes'] ?? []);
+    final idBase = med.id.hashCode.abs() % 100000;
+    int slotIndex = 0;
+
+    for (final t in times) {
+      final parts = t.split(':');
+      if (parts.length != 2) continue;
+      final h = int.tryParse(parts[0]) ?? 0;
+      final m = int.tryParse(parts[1]) ?? 0;
+      final doseTime = DateTime(now.year, now.month, now.day, h, m);
+
+      for (int ri = 0; ri < _kReminderOffsets.length; ri++) {
+        final offsetMins = _kReminderOffsets[ri];
+        final fireAt = doseTime.add(Duration(minutes: offsetMins));
+
+        if (!fireAt.isBefore(windowStart) && !fireAt.isAfter(windowEnd)) {
+          final String title;
+          final String body;
+          if (offsetMins == 0) {
+            title = 'Time for $medName!';
+            body = 'Take your dose now.';
+          } else if (offsetMins == -60) {
+            title = '1 hour until your $medName dose';
+            body = 'Tap to prepare for your upcoming dose.';
+          } else {
+            title = '${-offsetMins} minutes until your $medName dose';
+            body = 'Tap to prepare for your upcoming dose.';
+          }
+
+          await _localNotifs.show(
+            id: idBase + slotIndex * 5 + ri,
+            title: title,
+            body: body,
+            notificationDetails:
+                offsetMins == 0 ? _kAlarmNotifDetails : _kNotifDetails,
+          );
+          debugPrint('checkAndShow: fired "$title" (id ${idBase + slotIndex * 5 + ri})');
+        }
+      }
+      slotIndex++;
     }
   }
 }

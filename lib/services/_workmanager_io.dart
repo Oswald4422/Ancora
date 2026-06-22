@@ -17,6 +17,7 @@ void callbackDispatcher() {
       await Firebase.initializeApp(
           options: DefaultFirebaseOptions.currentPlatform);
       await NotificationService.initForIsolate();
+      await checkAndShowDueNotifications();
       await runMissedDoseSweep();
       await rescheduleAll();
     }
@@ -29,8 +30,8 @@ Future<void> initWorkmanager() async {
   await Workmanager().registerPeriodicTask(
     kMissedSweepTask,
     kMissedSweepTask,
-    frequency: const Duration(minutes: 30),
-    existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
+    frequency: const Duration(minutes: 15),
+    existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
     constraints: Constraints(networkType: NetworkType.connected),
   );
 }
